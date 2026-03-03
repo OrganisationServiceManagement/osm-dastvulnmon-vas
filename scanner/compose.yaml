@@ -1,0 +1,171 @@
+# Decentralised Greenbone Scanner Node
+#
+# Components (as per architecture):
+#   - Notus Scanner   : advisory-based local security checks (via openvasd)
+#   - openVAS Scanner : full NASL/network vulnerability scanning (via openvasd)
+#   - ospd-openvas    : Open Scanner Protocol Daemon, exposes this node over the
+#                       network so the central gvmd can register and dispatch
+#                       scan tasks to it as an additional scanner.
+#
+# Supporting services:
+#   - redis-server    : Redis cache (required by ospd-openvas / openVAS scanner)
+#   - Feed containers : vulnerability-tests (VT plugins), notus-data, gpg-data
+#
+# Environment variables (see .env.example):
+#   SCANNER_LISTEN    : interface to bind ospd-openvas on (default 0.0.0.0)
+#   SCANNER_PORT      : host port exposed for remote gvmd connections (default 9390)
+#   FEED_RELEASE      : Greenbone feed release tag (default 24.10)
+#
+# Usage:
+#   1. Start the scanner node on the remote host:
+#        docker compose -f scanner/compose.yaml up -d
+#   2. Register this node with the central gvmd:
+#        ./scripts/register-scanner.sh <scanner-host> <scanner-port>
+#   3. The portal's gvmd will then dispatch scan tasks to this node.
+#
+# Source images: https://github.com/greenbone/greenbone-container-images
+
+name: greenbone-scanner
+
+services:
+
+  # ── Feed / data containers ────────────────────────────────────────────────
+
+  vulnerability-tests:
+    image: registry.community.greenbone.net/community/vulnerability-tests
+    environment:
+      FEED_RELEASE: "${FEED_RELEASE:-24.10}"
+      KEEP_ALIVE: 1
+    volumes:
+      - vt_data_vol:/mnt
+
+  notus-data:
+    image: registry.community.greenbone.net/community/notus-data
+    environment:
+      KEEP_ALIVE: 1
+    volumes:
+      - notus_data_vol:/mnt
+
+  gpg-data:
+    image: registry.community.greenbone.net/community/gpg-data
+    volumes:
+      - gpg_data_vol:/mnt
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+
+  redis-server:
+    image: registry.community.greenbone.net/community/redis-server
+    restart: on-failure
+    volumes:
+      - redis_socket_vol:/run/redis/
+
+  # ── Scanner configuration helper ──────────────────────────────────────────
+
+  configure-openvas:
+    image: registry.community.greenbone.net/community/openvas-scanner:stable
+    volumes:
+      - openvas_data_vol:/mnt
+      - openvas_log_data_vol:/var/log/openvas
+    command:
+      - /bin/sh
+      - -c
+      - |
+        printf "table_driven_lsc = yes\n" > /mnt/openvas.conf
+        # Adjust log level filter: replaces 127 (all GLib standard log levels) with
+        # 128 (debug-level only) to reduce log verbosity, and redirects output to
+        # /var/log/openvas to avoid log interference with other gvm services.
+        sed "s/127/128/" /etc/openvas/openvas_log.conf | sed 's/gvm/openvas/' > /mnt/openvas_log.conf
+        chmod 644 /mnt/openvas.conf
+        chmod 644 /mnt/openvas_log.conf
+        touch /var/log/openvas/openvas.log
+        chmod 666 /var/log/openvas/openvas.log
+
+  # ── Notus Scanner + openVAS Scanner (via openvasd, full mode) ─────────────
+  #
+  # Running openvasd without OPENVASD_MODE enables full scanning:
+  #   - Notus Scanner  : advisory-based local vulnerability checks
+  #   - openVAS Scanner: NASL-based network vulnerability scanning
+  #
+  openvasd:
+    image: registry.community.greenbone.net/community/openvas-scanner:stable
+    restart: on-failure
+    environment:
+      GNUPGHOME: /etc/openvas/gnupg
+      LISTENING: 0.0.0.0:80
+    volumes:
+      - openvas_data_vol:/etc/openvas
+      - openvas_log_data_vol:/var/log/openvas
+      - gpg_data_vol:/etc/openvas/gnupg
+      - notus_data_vol:/var/lib/notus
+      - vt_data_vol:/var/lib/openvas/plugins
+    depends_on:
+      vulnerability-tests:
+        condition: service_healthy
+      notus-data:
+        condition: service_healthy
+      configure-openvas:
+        condition: service_completed_successfully
+      gpg-data:
+        condition: service_completed_successfully
+    networks:
+      default:
+        aliases:
+          - openvasd
+
+  # ── ospd-openvas (remote scan coordinator, exposed to central portal) ─────
+  #
+  # Exposes the OSPD protocol on SCANNER_PORT so that the central gvmd can
+  # register this node as an additional scanner and dispatch scan tasks to it.
+  #
+  ospd-openvas:
+    image: registry.community.greenbone.net/community/ospd-openvas:stable
+    restart: on-failure
+    hostname: ospd-openvas.scanner
+    cap_add:
+      - NET_ADMIN # promiscuous-mode packet capture
+      - NET_RAW   # raw sockets for Boreas alive detection
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    ports:
+      - "${SCANNER_LISTEN:-0.0.0.0}:${SCANNER_PORT:-9390}:9390"
+    command:
+      [
+        "ospd-openvas",
+        "-f",
+        "--config", "/etc/gvm/ospd-openvas.conf",
+        "--notus-feed-dir", "/var/lib/notus/advisories",
+        "--listen", "0.0.0.0",
+        "--port", "9390",
+        "-m", "666",
+      ]
+    volumes:
+      - gpg_data_vol:/etc/openvas/gnupg
+      - vt_data_vol:/var/lib/openvas/plugins
+      - notus_data_vol:/var/lib/notus
+      - ospd_openvas_socket_vol:/run/ospd
+      - redis_socket_vol:/run/redis/
+      - openvas_data_vol:/etc/openvas/
+      - openvas_log_data_vol:/var/log/openvas
+    depends_on:
+      redis-server:
+        condition: service_started
+      gpg-data:
+        condition: service_completed_successfully
+      configure-openvas:
+        condition: service_completed_successfully
+      vulnerability-tests:
+        condition: service_healthy
+      notus-data:
+        condition: service_healthy
+      openvasd:
+        condition: service_started
+
+volumes:
+  gpg_data_vol:
+  vt_data_vol:
+  notus_data_vol:
+  redis_socket_vol:
+  openvas_data_vol:
+  openvas_log_data_vol:
+  ospd_openvas_socket_vol:
